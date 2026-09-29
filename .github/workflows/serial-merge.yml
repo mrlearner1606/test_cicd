@@ -1,0 +1,87 @@
+name: Serial Rebase Merge
+
+on:
+  pull_request:
+    types: [labeled]
+
+concurrency:
+  group: serial-merge
+  cancel-in-progress: false      # never kill the job that's currently merging
+  # queue: max                   # optional: newer GitHub option for a true FIFO queue (up to 100 pending).
+                                 # Uncomment only if GitHub accepts it on your repo. The loop below works without it.
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  serial-merge:
+    if: github.event.label.name == 'ready-to-merge'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Git identity
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Process queue (oldest PR first)
+        run: |
+          set -uo pipefail
+
+          while true; do
+            # Oldest open PR (lowest number) carrying the label
+            PR=$(gh pr list --state open --base main --label ready-to-merge \
+                   --json number --jq 'sort_by(.number) | .[0].number // empty')
+
+            if [ -z "$PR" ]; then
+              echo "Queue empty. Done."
+              break
+            fi
+
+            BRANCH=$(gh pr view "$PR" --json headRefName --jq .headRefName)
+            echo "=== Processing PR #$PR ($BRANCH) ==="
+
+            git fetch origin main "$BRANCH"
+            git checkout -B "$BRANCH" "origin/$BRANCH"
+
+            # Rebase on the LATEST main (includes everything merged before this PR)
+            if ! git rebase origin/main; then
+              git rebase --abort || true
+              gh pr edit "$PR" --remove-label ready-to-merge
+              gh pr comment "$PR" --body "Rebase onto main hit conflicts. Please rebase manually, fix conflicts, and re-add the ready-to-merge label."
+              continue
+            fi
+
+            # ---- optional: run your tests here, e.g. ----
+            # pip install -r requirements.txt && pytest -q || { \
+            #   gh pr edit "$PR" --remove-label ready-to-merge; \
+            #   gh pr comment "$PR" --body "Tests failed after rebase."; \
+            #   continue; }
+
+            git push --force-with-lease origin "$BRANCH"
+
+            # GitHub needs a few seconds to recompute mergeability after the push
+            MERGED=false
+            for i in 1 2 3 4 5 6; do
+              sleep 5
+              if gh pr merge "$PR" --rebase; then
+                MERGED=true
+                break
+              fi
+              echo "Merge attempt $i failed, retrying..."
+            done
+
+            if [ "$MERGED" = true ]; then
+              git push origin --delete "$BRANCH" || true
+            else
+              gh pr edit "$PR" --remove-label ready-to-merge
+              gh pr comment "$PR" --body "Could not merge after rebase. Check branch rules and re-add the label."
+            fi
+          done
